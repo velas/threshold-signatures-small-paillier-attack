@@ -969,11 +969,11 @@ pub struct BobProof {
     w: BigInt,
     z: BigInt,
     z_prim: BigInt,
-    e: HashWithNonce,
+    pub e: HashWithNonce,
     s: BigInt,
     s1: BigInt,
     s2: BigInt,
-    t1: BigInt,
+    pub t1: BigInt,
     t2: BigInt,
 }
 
@@ -1101,9 +1101,9 @@ impl BobProof {
 /// Bob's extended proof, adds the knowledge of $`B = g^b \in \mathcal{G}`$
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct BobProofExt {
-    proof: BobProof,
+    pub proof: BobProof,
     u: GE,
-    X: GE,
+    pub X: GE,
 }
 
 #[allow(clippy::too_many_arguments)]

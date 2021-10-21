@@ -350,15 +350,30 @@ impl Phase1 {
         secret_key_loader: ASecretKeyLoader,
         timeout: Option<Duration>,
     ) -> Result<Self, KeygenError> {
+        let mut malicious_party_paillier_pk = None;
         let proof = {
-            let dk = secret_key_loader
-                .get_paillier_secret()
-                .map(|dk| ManagedPaillierDecryptionKey(dk))
-                .map_err(|e| KeygenError::ProtocolSetupError(e.0))?;
-            if !PaillierKeys::is_valid(&init_keys.paillier_encryption_key, &dk.0) {
-                return Err(KeygenError::ProtocolSetupError(
-                    "invalid own Paillier key".to_string(),
-                ));
+            let dk = if own_party_index != PartyIndex::from(0) {
+                secret_key_loader
+                    .get_paillier_secret()
+                    .map(|dk| ManagedPaillierDecryptionKey(dk))
+                    .map_err(|e| KeygenError::ProtocolSetupError(e.0))?
+            }
+            // malicious party chooses a random 256-bit Paillier key
+            else {
+                ManagedPaillierDecryptionKey(Box::new(DecryptionKey {
+                    p: BigInt::from_str_radix("340282366920938463463374607431768211297", 10).unwrap(),
+                    q: BigInt::from_str_radix("340282366920938463463374607431768211537", 10).unwrap(),
+                }))
+            };
+            if own_party_index != PartyIndex::from(0) {
+                if !PaillierKeys::is_valid(&init_keys.paillier_encryption_key, &dk.0) {
+                    return Err(KeygenError::ProtocolSetupError(
+                        "invalid own Paillier key".to_string(),
+                    ));
+                }
+            }
+            else {
+                malicious_party_paillier_pk = Some(EncryptionKey::from(&(dk.0.p.clone() * dk.0.q.clone())));
             }
             nizk_rsa::gen_proof(&dk.0)
         };
@@ -383,17 +398,32 @@ impl Phase1 {
             verify_zkp_public_setup(setup)
                 .map_err(|e| KeygenError::ProtocolSetupError(format!("{:?}", e)))?;
         }
-        Ok(Phase1 {
-            params: *params,
-            keys: init_keys,
-            own_party_index,
-            other_parties,
-            comm_scheme: scheme,
-            secret_key_loader,
-            paillier_key_proof: CorrectKeyProof(proof),
-            range_proof_setup,
-            timeout,
-        })
+        return if own_party_index != PartyIndex::from(0) {
+            Ok(Phase1 {
+                params: *params,
+                keys: init_keys,
+                own_party_index,
+                other_parties,
+                comm_scheme: scheme,
+                secret_key_loader,
+                paillier_key_proof: CorrectKeyProof(proof),
+                range_proof_setup,
+                timeout,
+            })
+        } else {
+            Ok(Phase1 {
+                params: *params,
+                keys: InitialPublicKeys { y_i: init_keys.y_i,
+                    paillier_encryption_key: malicious_party_paillier_pk.unwrap() },
+                own_party_index,
+                other_parties,
+                comm_scheme: scheme,
+                secret_key_loader,
+                paillier_key_proof: CorrectKeyProof(proof),
+                range_proof_setup,
+                timeout,
+            })
+        }
     }
 }
 
@@ -506,7 +536,7 @@ impl State<KeyGeneratorTraits> for Phase1 {
     }
 }
 
-/// Second phase of the protocol: broadcasts decommitments, verifies them, and verifies Pailliier key correctness
+/// Second phase of the protocol: broadcasts decommitments, verifies them, and verifies Paillier key correctness
 struct Phase2 {
     params: Parameters,
     keys: InitialPublicKeys,
@@ -855,7 +885,11 @@ impl State<KeyGeneratorTraits> for Phase3 {
         }
 
         // panic() on dk_loader_result.unwrap() is unreachable as dk_loader_result.is_err() is checked above
-        let dk = dk_loader_result.unwrap();
+        let dk = if self.own_party_index != PartyIndex::from(0) { dk_loader_result.unwrap() }
+            else { ManagedPaillierDecryptionKey(Box::new(DecryptionKey {
+                p: BigInt::from_str_radix("340282366920938463463374607431768211297", 10).unwrap(),
+                q: BigInt::from_str_radix("340282366920938463463374607431768211537", 10).unwrap(),
+            })) };
         // panic() on public_key.unwrap() is unreachable as try_computing_public_key().is_err() is checked above
         let public_key = from_secp256k1_pk(public_key.unwrap()).expect("invalid full public key");
         let points = self

@@ -116,11 +116,12 @@ pub fn verify(encryption: &EncryptionKey, sigmas: &[BigInt]) -> Result<(), NIZKE
     }
 
     let n = &encryption.n;
-    let bit_length_of_n = n.bit_length();
-
-    if bit_length_of_n < N_MIN_SIZE {
-        return Err(NIZKError::WrongSizeOfN(bit_length_of_n));
-    }
+    // commenting out n size check to make the attack possible
+    // let bit_length_of_n = n.bit_length();
+    //
+    // if bit_length_of_n < N_MIN_SIZE {
+    //     return Err(NIZKError::WrongSizeOfN(bit_length_of_n));
+    // }
 
     let rho_correct = sigmas
         .iter()
